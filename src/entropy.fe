@@ -1,0 +1,41 @@
+use super::engine::Trace
+
+/// Injectable test entropy without implicit host or chain state.
+pub trait Entropy {
+    fn next(mut self) -> u64
+}
+
+/// Xorshift64 (13, 7, 17); not cryptographic randomness.
+pub struct XorShift64 { pub state: u64 }
+
+impl XorShift64 {
+    pub fn seeded(_ seed: u64) -> Self {
+        Self { state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed } }
+    }
+}
+
+impl Entropy for XorShift64 {
+    fn next(mut self) -> u64 {
+        var x = self.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        self.state = x
+        x
+    }
+}
+
+/// Modulo mapping is intentionally not uniform. Requires len <= N, upper > 0.
+pub fn generate<const N: usize>(_ len: usize, _ upper: u64) -> Trace<N>
+uses (rng: mut Entropy)
+{
+    assert!(len <= N)
+    assert!(upper > 0)
+    var trace = Trace<N> { words: [0; N], len }
+    var i: usize = 0
+    while i < len {
+        trace.words[i] = rng.next() % upper
+        i += 1
+    }
+    trace
+}

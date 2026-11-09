@@ -1,0 +1,4 @@
+//! Deterministic state-machine checks and bounded, failure-preserving reduction.
+pub use engine::{Machine, Replay, Trace, Reduction, replay, reduce}
+pub use entropy::{Entropy, XorShift64, generate}
+pub use ledger::Ledger

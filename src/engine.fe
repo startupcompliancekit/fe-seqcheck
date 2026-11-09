@@ -1,0 +1,128 @@
+/// Models must reset completely and behave deterministically on replay.
+pub trait Machine {
+    fn reset(mut self)
+    /// False marks rejection. Invariants are checked even on rejection.
+    fn step(mut self, _ word: u64) -> bool
+    /// Zero means success. Stable nonzero IDs identify distinct invariants.
+    fn invariant(self) -> u32
+}
+
+pub struct Trace<const N: usize> { pub words: [u64; N], pub len: usize }
+
+impl<const N: usize> Copy for Trace<N> {}
+
+pub struct Replay {
+    pub failure: u32,
+    /// Actions examined; zero for failure immediately after reset.
+    pub attempted: usize,
+    pub accepted: usize,
+}
+
+/// Replay from reset; stop at the first failed invariant.
+pub fn replay<M: Machine, const N: usize>(_ model: mut M, _ trace: Trace<N>) -> Replay {
+    assert!(trace.len <= N)
+    model.reset()
+    var report = Replay { failure: model.invariant(), attempted: 0, accepted: 0 }
+    if report.failure != 0 {
+        return report
+    }
+    while report.attempted < trace.len {
+        let accepted = model.step(trace.words[report.attempted])
+        report.attempted += 1
+        if accepted {
+            report.accepted += 1
+        }
+        report.failure = model.invariant()
+        if report.failure != 0 {
+            return report
+        }
+    }
+    report
+}
+
+pub struct Reduction<const N: usize> {
+    pub trace: Trace<N>,
+    pub failure: u32,
+    /// Candidate replays, excluding the baseline replay.
+    pub evaluations: usize,
+    /// A full fixed-point pass could not finish within the budget.
+    pub exhausted: bool,
+}
+
+fn without<const N: usize>(_ trace: Trace<N>, _ index: usize) -> Trace<N> {
+    var candidate = Trace<N> { words: [0; N], len: trace.len - 1 }
+    var i: usize = 0
+    while i < candidate.len {
+        candidate.words[i] = trace.words[if i < index { i } else { i + 1 }]
+        i += 1
+    }
+    candidate
+}
+
+/// Delete actions and try zero / successive integer halves to a fixed point.
+/// Only the original first failure ID is accepted. Determinism is required.
+pub fn reduce<M: Machine, const N: usize>(
+    _ model: mut M,
+    _ trace: Trace<N>,
+    _ budget: usize,
+) -> Reduction<N> {
+    let baseline = replay(mut model, trace)
+    var result = Reduction<N> { trace, failure: baseline.failure, evaluations: 0, exhausted: false }
+    if baseline.failure == 0 {
+        return result
+    }
+    result.trace.len = baseline.attempted
+    var changed = true
+    while changed {
+        changed = false
+        var i: usize = 0
+        while i < result.trace.len {
+            if result.evaluations == budget {
+                result.exhausted = true
+                return result
+            }
+            let candidate = without(result.trace, i)
+            let report = replay(mut model, candidate)
+            result.evaluations += 1
+            if report.failure == result.failure {
+                result.trace = candidate
+                result.trace.len = report.attempted
+                changed = true
+            } else {
+                i += 1
+            }
+        }
+        i = 0
+        while i < result.trace.len {
+            let original = result.trace.words[i]
+            if original != 0 {
+                var value: u64 = 0
+                var done = false
+                while !done {
+                    if result.evaluations == budget {
+                        result.exhausted = true
+                        return result
+                    }
+                    var candidate = result.trace
+                    candidate.words[i] = value
+                    let report = replay(mut model, candidate)
+                    result.evaluations += 1
+                    if report.failure == result.failure {
+                        result.trace = candidate
+                        result.trace.len = report.attempted
+                        changed = true
+                        done = true
+                    } else if value == 0 {
+                        value = original / 2
+                        if value == 0 { done = true }
+                    } else {
+                        value /= 2
+                        if value == 0 { done = true }
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+    result
+}

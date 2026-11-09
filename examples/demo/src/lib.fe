@@ -1,0 +1,177 @@
+use core::AsBytes
+use std::native::{Args, Arg}
+use std::io::{Write, host, write, write_char}
+use seqcheck::{Ledger, Trace, Replay, Entropy, XorShift64, generate, replay, reduce}
+
+fn arg_is<T: AsBytes>(_ arg: Arg, _ text: T) -> bool {
+    let bytes = text.as_bytes()
+    if arg.len() != T::N {
+        return false
+    }
+    var i: usize = 0
+    while i < T::N {
+        if arg.byte_at(i) != bytes[i] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+struct Parsed { value: u64, ok: bool }
+
+fn number(_ arg: Arg) -> Parsed {
+    if arg.len() == 0 {
+        return Parsed { value: 0, ok: false }
+    }
+    var value: u64 = 0
+    var i: usize = 0
+    while i < arg.len() {
+        let byte = arg.byte_at(i)
+        if byte < 48 || byte > 57 {
+            return Parsed { value: 0, ok: false }
+        }
+        let digit = (byte - 48) as u64
+        if value > (0xffffffffffffffff - digit) / 10 {
+            return Parsed { value: 0, ok: false }
+        }
+        value = value * 10 + digit
+        i += 1
+    }
+    Parsed { value, ok: true }
+}
+
+fn decimal(_ n: u64) uses (w: mut Write) {
+    var digits: [u8; 20] = [0; 20]
+    var value = n
+    var count: usize = 0
+    while value >= 10 {
+        digits[count] = (value % 10).downcast_truncate()
+        count += 1
+        value /= 10
+    }
+    write_char((48 + value).downcast().unwrap())
+    while count > 0 {
+        count -= 1
+        write_char((48 + digits[count]) as i32)
+    }
+}
+
+fn words<const N: usize>(_ t: Trace<N>) uses (w: mut Write) {
+    write("[")
+    var i: usize = 0
+    while i < t.len {
+        if i != 0 { write(",") }
+        decimal(t.words[i])
+        i += 1
+    }
+    write("]")
+}
+
+fn outcome(_ r: Replay) uses (w: mut Write) {
+    write("\"failure\":")
+    decimal(r.failure as u64)
+    write(",\"attempted\":")
+    decimal(r.attempted.downcast().unwrap())
+    write(",\"accepted\":")
+    decimal(r.accepted.downcast().unwrap())
+}
+
+fn invalid() -> i32 {
+    with (Write = host()) {
+        write(
+            "{\"error\":\"usage: demo buggy|fixed [seed [budget<=10000]] or replay|replay-fixed [up to 64 u64 words]\"}",
+        )
+        write_char(10)
+    }
+    2
+}
+
+pub fn main(argc: i32, argv: **u8) -> i32 {
+    let args = unsafe {
+        Args::new(argc, argv)
+    }
+    if args.len() < 2 {
+        return invalid()
+    }
+    let mode = args.get(1)
+    let is_replay = arg_is(mode, "replay") || arg_is(mode, "replay-fixed")
+    let fixed = arg_is(mode, "fixed") || arg_is(mode, "replay-fixed")
+    if !is_replay && !fixed && !arg_is(mode, "buggy") {
+        return invalid()
+    }
+    var model = Ledger::new(!fixed)
+    if is_replay {
+        if args.len() > 66 {
+            return invalid()
+        }
+        var t = Trace<64> { words: [0; 64], len: args.len() - 2 }
+        var i: usize = 0
+        while i < t.len {
+            let p = number(args.get(i + 2))
+            if !p.ok { return invalid() }
+            t.words[i] = p.value
+            i += 1
+        }
+        let report = replay(mut model, t)
+        with (Write = host()) {
+            write("{\"schema\":1,\"mode\":\"replay\",")
+            outcome(report)
+            write(",\"trace\":")
+            words(t)
+            write("}")
+            write_char(10)
+        }
+        return if report.failure == 0 { 0 } else { 1 }
+    }
+    if args.len() > 4 {
+        return invalid()
+    }
+    var seed: u64 = 42
+    var budget: u64 = 1000
+    if args.len() >= 3 {
+        let p = number(args.get(2))
+        if !p.ok { return invalid() }
+        seed = p.value
+    }
+    if args.len() == 4 {
+        let p = number(args.get(3))
+        if !p.ok || p.value > 10000 {
+            return invalid()
+        }
+        budget = p.value
+    }
+    var rng = XorShift64::seeded(seed)
+    let trace = with (Entropy = rng) {
+        generate<64>(64, 16)
+    }
+    let report = replay(mut model, trace)
+    let reduced = reduce(mut model, trace, budget as usize)
+    let reproduced = replay(mut model, reduced.trace)
+    assert!(reproduced.failure == report.failure)
+    with (Write = host()) {
+        write("{\"schema\":1,\"mode\":\"generated\",\"fixed\":")
+        if fixed { write("true") } else { write("false") }
+        write(",\"seed\":")
+        decimal(seed)
+        write(",\"budget\":")
+        decimal(budget)
+        write(",")
+        outcome(report)
+        write(",\"trace\":")
+        words(trace)
+        write(",\"reduced\":")
+        words(reduced.trace)
+        write(",\"evaluations\":")
+        decimal(reduced.evaluations.downcast().unwrap())
+        write(",\"exhausted\":")
+        if reduced.exhausted {
+            write("true")
+        } else {
+            write("false")
+        }
+        write("}")
+        write_char(10)
+    }
+    if report.failure == 0 { 0 } else { 1 }
+}

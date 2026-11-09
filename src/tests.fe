@@ -1,0 +1,268 @@
+use super::{Machine, Trace, replay, reduce, Entropy, XorShift64, generate}
+use super::ledger::Ledger
+
+struct Counter { value: u64, threshold: u64 }
+impl Machine for Counter {
+    fn reset(mut self) {
+        self.value = 0
+    }
+    fn step(mut self, _ word: u64) -> bool {
+        self.value += word % 100
+        true
+    }
+    fn invariant(self) -> u32 {
+        if self.value >= self.threshold { 11 } else { 0 }
+    }
+}
+
+struct Rejecting { mutated: bool }
+impl Machine for Rejecting {
+    fn reset(mut self) {
+        self.mutated = false
+    }
+    fn step(mut self, _ word: u64) -> bool {
+        self.mutated = word == 9
+        false
+    }
+    fn invariant(self) -> u32 {
+        if self.mutated { 23 } else { 0 }
+    }
+}
+
+struct Category { failure: u32 }
+impl Machine for Category {
+    fn reset(mut self) {
+        self.failure = 0
+    }
+    fn step(mut self, _ word: u64) -> bool {
+        self.failure = if word == 10 {
+            10
+        } else if word == 0 { 99 } else { 0 }
+        true
+    }
+    fn invariant(self) -> u32 {
+        self.failure
+    }
+}
+
+struct ConstantEntropy { value: u64, calls: usize }
+impl Entropy for ConstantEntropy {
+    fn next(mut self) -> u64 {
+        self.calls += 1
+        self.value
+    }
+}
+
+#[test]
+fn first_failure_and_suffix() {
+    var m = Ledger::new(true)
+    let t = Trace<5> { words: [1, 0, 1, 14, 14], len: 5 }
+    let r = replay(mut m, t)
+    assert!(r.failure == 7)
+    assert!(r.attempted == 3)
+    assert!(r.accepted == 2)
+}
+
+#[test]
+fn reset_is_repeated() {
+    var m = Counter { value: 999, threshold: 5 }
+    let t = Trace<1> { words: [3], len: 1 }
+    assert!(replay(mut m, t).failure == 0)
+    assert!(replay(mut m, t).failure == 0)
+    assert!(m.value == 3)
+}
+
+#[test]
+fn initial_failure_is_empty() {
+    var m = Counter { value: 5, threshold: 0 }
+    let t = Trace<2> { words: [1, 2], len: 2 }
+    let r = replay(mut m, t)
+    assert!(r.failure == 11 && r.attempted == 0 && r.accepted == 0)
+    let s = reduce(mut m, t, 0)
+    assert!(s.trace.len == 0 && s.failure == 11)
+    assert!(s.evaluations == 0 && !s.exhausted)
+}
+
+#[test]
+fn empty_capacity_passes() {
+    var m = Ledger::new(true)
+    let t = Trace<0> { words: [], len: 0 }
+    let r = replay(mut m, t)
+    assert!(r.failure == 0 && r.attempted == 0)
+    let s = reduce(mut m, t, 0)
+    assert!(s.failure == 0 && !s.exhausted)
+}
+
+#[test]
+fn rejection_is_counted() {
+    var m = Ledger::new(false)
+    let t = Trace<3> { words: [1, 3, 5], len: 3 }
+    let r = replay(mut m, t)
+    assert!(r.failure == 0 && r.attempted == 3 && r.accepted == 0)
+}
+
+#[test]
+fn rejected_action_cannot_hide_mutation() {
+    var m = Rejecting { mutated: false }
+    let t = Trace<2> { words: [0, 9], len: 2 }
+    let r = replay(mut m, t)
+    assert!(r.failure == 23 && r.attempted == 2 && r.accepted == 0)
+}
+
+#[test]
+fn same_failure_category_only() {
+    var m = Category { failure: 0 }
+    let t = Trace<1> { words: [10], len: 1 }
+    let s = reduce(mut m, t, 100)
+    assert!(s.failure == 10 && s.trace.len == 1)
+    assert!(s.trace.words[0] == 10 && !s.exhausted)
+}
+
+#[test]
+fn zero_budget_preserves_failing_prefix() {
+    var m = Ledger::new(true)
+    let t = Trace<4> { words: [0, 1, 6, 8], len: 4 }
+    let s = reduce(mut m, t, 0)
+    assert!(s.exhausted && s.evaluations == 0 && s.trace.len == 2)
+    assert!(replay(mut m, s.trace).failure == 7)
+}
+
+#[test]
+fn passing_input_unchanged() {
+    var m = Ledger::new(false)
+    let t = Trace<4> { words: [0, 1, 2, 3], len: 4 }
+    let s = reduce(mut m, t, 1)
+    assert!(s.failure == 0 && s.evaluations == 0 && !s.exhausted)
+    assert!(s.trace.len == 4 && s.trace.words == t.words)
+}
+
+#[test]
+fn shrinks_deposits_and_withdrawal() {
+    var m = Ledger::new(true)
+    let t = Trace<8> { words: [1, 14, 12, 15, 0, 0, 0, 0], len: 4 }
+    let s = reduce(mut m, t, 1000)
+    assert!(s.failure == 7 && !s.exhausted)
+    assert!(s.trace.len == 2)
+    assert!(s.trace.words[0] == 0 && s.trace.words[1] == 1)
+    assert!(replay(mut m, s.trace).failure == 7)
+}
+
+#[test]
+fn numeric_threshold_reduces() {
+    var m = Counter { value: 0, threshold: 5 }
+    let t = Trace<1> { words: [80], len: 1 }
+    let s = reduce(mut m, t, 100)
+    assert!(s.trace.words[0] == 5 && !s.exhausted)
+}
+
+#[test]
+fn budgets_bound_every_candidate() {
+    var budget: usize = 0
+    while budget < 30 {
+        var m = Ledger::new(true)
+        let t = Trace<4> { words: [14, 12, 15, 14], len: 4 }
+        let s = reduce(mut m, t, budget)
+        assert!(s.evaluations <= budget)
+        assert!(replay(mut m, s.trace).failure == 7)
+        budget += 1
+    }
+}
+
+#[test]
+fn deterministic_seed_stream() {
+    var rng = XorShift64::seeded(1)
+    assert!(rng.next() == 1082269761)
+    assert!(rng.next() == 1152992998833853505)
+    assert!(rng.next() == 11177516664432764457)
+}
+
+#[test]
+fn zero_seed_does_not_stick() {
+    var rng = XorShift64::seeded(0)
+    let a = rng.next()
+    let b = rng.next()
+    assert!(a != 0 && b != 0 && a != b)
+}
+
+#[test]
+fn entropy_effect_is_injectable() {
+    var rng = ConstantEntropy { value: 17, calls: 0 }
+    let t = with (Entropy = rng) {
+        generate<4>(3, 10)
+    }
+    assert!(t.words == [7, 7, 7, 0] && t.len == 3)
+    assert!(rng.calls == 3)
+}
+
+#[test]
+fn no_draw_for_empty_generation() {
+    var rng = ConstantEntropy { value: 17, calls: 0 }
+    let t = with (Entropy = rng) {
+        generate<0>(0, 1)
+    }
+    assert!(t.len == 0 && rng.calls == 0)
+}
+
+#[test]
+fn generated_bounds_and_repeatability() {
+    var a = XorShift64::seeded(42)
+    var b = XorShift64::seeded(42)
+    let x = with (Entropy = a) {
+        generate<64>(64, 16)
+    }
+    let y = with (Entropy = b) {
+        generate<64>(64, 16)
+    }
+    assert!(x.words == y.words)
+    var i: usize = 0
+    while i < x.len {
+        assert!(x.words[i] < 16)
+        i += 1
+    }
+}
+
+#[test]
+fn fixed_ledger_many_sequences() {
+    var seed: u64 = 1
+    while seed <= 128 {
+        var rng = XorShift64::seeded(seed)
+        let t = with (Entropy = rng) {
+            generate<64>(64, 16)
+        }
+        var m = Ledger::new(false)
+        let r = replay(mut m, t)
+        assert!(r.failure == 0 && r.attempted == 64 && r.accepted > 0)
+        seed += 1
+    }
+}
+
+#[test]
+fn reduction_is_a_fixed_point() {
+    var m = Ledger::new(true)
+    let t = Trace<4> { words: [14, 12, 15, 14], len: 4 }
+    let a = reduce(mut m, t, 1000)
+    let b = reduce(mut m, a.trace, 1000)
+    assert!(!a.exhausted && !b.exhausted)
+    assert!(
+        a.trace.len == b.trace.len && a.trace.words == b.trace.words,
+    )
+}
+
+#[test]
+fn finished_trace_is_single_deletion_irreducible() {
+    var m = Counter { value: 0, threshold: 9 }
+    let t = Trace<6> { words: [0, 3, 0, 4, 2, 80], len: 6 }
+    let s = reduce(mut m, t, 1000)
+    assert!(!s.exhausted && s.failure == 11)
+    var omit: usize = 0
+    while omit < s.trace.len {
+        var c = Trace<6> { words: [0; 6], len: s.trace.len - 1 }
+        var j: usize = 0
+        while j < c.len {
+            c.words[j] = s.trace.words[if j < omit { j } else { j + 1 }]
+            j += 1
+        }
+        assert!(replay(mut m, c).failure != s.failure)
+        omit += 1
+    }
+}

@@ -1,0 +1,44 @@
+//! Demonstration model: two accounting views must agree after each operation.
+use super::engine::Machine
+
+pub struct Ledger { pub balance: u64, pub accounted: u64, pub buggy: bool }
+
+impl Ledger {
+    pub fn new(_ buggy: bool) -> Self {
+        Self { balance: 0, accounted: 0, buggy }
+    }
+}
+
+impl Machine for Ledger {
+    fn reset(mut self) {
+        self.balance = 0
+        self.accounted = 0
+    }
+
+    fn step(mut self, _ word: u64) -> bool {
+        let amount = 1 + (word / 2) % 8
+        if word % 2 == 0 {
+            // Reject before either field can overflow.
+            if self.balance > 0xffffffffffffffff - amount {
+                return false
+            }
+            if self.accounted > 0xffffffffffffffff - amount {
+                return false
+            }
+            self.balance += amount
+            self.accounted += amount
+        } else {
+            if self.balance < amount || self.accounted < amount {
+                return false
+            }
+            self.balance -= amount
+            // Intentional demo fault: one unit stays in the accounting view.
+            self.accounted -= if self.buggy { amount - 1 } else { amount }
+        }
+        true
+    }
+
+    fn invariant(self) -> u32 {
+        if self.balance == self.accounted { 0 } else { 7 }
+    }
+}
