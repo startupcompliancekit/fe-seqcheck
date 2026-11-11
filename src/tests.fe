@@ -1,5 +1,57 @@
-use super::{Machine, Trace, replay, reduce, Entropy, XorShift64, generate}
+use super::{Machine, Trace, replay, reduce, Entropy, XorShift64, StdEntropy, generate}
 use super::ledger::Ledger
+use std::evm::random::{ReplayRng, Rng}
+
+struct CountingRng { calls: u64 }
+impl Rng for CountingRng {
+    fn next(mut self) -> u256 {
+        self.calls += 1
+        self.calls as u256
+    }
+}
+
+#[test]
+fn standard_rng_low_bits_and_continuation() {
+    var rng = StdEntropy { rng: ReplayRng::new([(1 as u256) << 200 | 17, 0xffffffffffffffff, 3]) }
+    let trace = with (Entropy = rng) {
+        generate<4>(4, 10)
+    }
+    assert!(trace.words == [7, 5, 3, 7] && trace.len == 4)
+    assert!(rng.next() == 0xffffffffffffffff)
+    assert!(rng.rng.next() == 3)
+}
+
+#[test]
+fn standard_rng_draw_count_and_empty_generation() {
+    var rng = StdEntropy { rng: CountingRng { calls: 0 } }
+    let empty = with (Entropy = rng) {
+        generate<0>(0, 10)
+    }
+    assert!(empty.len == 0 && rng.rng.calls == 0)
+    let trace = with (Entropy = rng) {
+        generate<4>(3, 10)
+    }
+    assert!(trace.words == [1, 2, 3, 0] && trace.len == 3)
+    assert!(rng.rng.calls == 3)
+}
+
+#[test]
+fn standard_rng_trace_reduces_and_replays() {
+    var rng = StdEntropy { rng: ReplayRng::new([1, 14, 12, 15]) }
+    let trace = with (Entropy = rng) {
+        generate<8>(8, 16)
+    }
+    var buggy = Ledger::new(true)
+    assert!(replay(mut buggy, trace).failure == 7)
+    let reduced = reduce(mut buggy, trace, 1000)
+    assert!(reduced.failure == 7 && !reduced.exhausted)
+    assert!(reduced.trace.len == 2)
+    assert!(reduced.trace.words[0] == 0 && reduced.trace.words[1] == 1)
+    assert!(replay(mut buggy, reduced.trace).failure == 7)
+    var fixed = Ledger::new(false)
+    assert!(replay(mut fixed, trace).failure == 0)
+    assert!(replay(mut fixed, reduced.trace).failure == 0)
+}
 
 struct Counter { value: u64, threshold: u64 }
 impl Machine for Counter {

@@ -12,10 +12,33 @@ This is a small library for testing explicit state models. It complements
 `fe test` and external Foundry tests. It does not implement coverage-guided
 fuzzing, deploy contracts, or provide Foundry integration.
 
+## How this builds on Fe's standard library
+
+Fe 26.5.0 already provides
+[`std::evm::random`](https://github.com/argotorg/fe/blob/v26.5.0/ingots/std/src/evm/random.fe):
+the `Rng` effect, seeded `KeccakRng`, supplied-word `ReplayRng`, unbiased
+bounded sampling, and shuffle/choose helpers. Seeded randomness, random-word
+replay and an injectable RNG effect are existing capabilities, not SeqCheck's
+contribution.
+
+SeqCheck adds a state-machine testing layer: resetting a model, executing a
+command trace, checking invariants after every attempt (including rejected
+commands), and recording the first failure ID. Its budgeted reducer removes
+commands and shrinks their values while preserving that failure ID, producing
+a trace that can be replayed as a regression. Standard `ReplayRng` repeats RNG
+words; SeqCheck's `replay` executes model commands and checks invariants.
+
+`StdEntropy<R>` connects an existing standard-library `Rng` to SeqCheck's
+generator. It consumes exactly one 256-bit word per draw and retains its low
+64 bits; `generate` then applies its documented modulo mapping. It does not
+use `Rng.uniform`, promise unbiased sampling, or improve the supplied RNG's
+security. The small `XorShift64` implementation remains a portable default
+for the native demo, not a claim of a new RNG algorithm.
+
 ## Reproduce
 
-Tested platform: Linux x86-64, Fe **26.5.0**, Python 3.10+ and a system C compiler
-(`cc`). No Python packages are required. From this repository root:
+Build requirements: Fe **26.5.0**, Python 3.10+ and a C compiler (`cc`).
+No Python packages are required. From this repository root:
 
 ```sh
 python3 scripts/install_fe.py
@@ -25,15 +48,15 @@ python3 scripts/check.py
 The installer downloads one official compiler binary into `.tools/fe` and checks
 its pinned SHA-256 before making it executable. It runs no remote installer or
 global installation. If Fe 26.5.0 is already installed, skip the first command
-and set `FE=/path/to/fe` for `scripts/check.py`.
+and set `FE` to the verified compiler executable for `scripts/check.py`.
 
 `check.py` checks formatting, runs the Fe suite on both backends, builds the
 native example and runs an independent Python behavioral oracle. Detailed
 results are written to `target/checks.json` and `target/*.log`. The CI workflow
-runs these same commands. CI has been prepared locally; no hosted run is claimed.
+runs these same commands.
 
 The installer intentionally supports only Linux x86-64. Other platforms need
-their own verified Fe 26.5.0 release and C linker; they have not been tested here.
+their own verified Fe 26.5.0 release and C linker.
 
 ## A failure you can explain
 
@@ -117,11 +140,30 @@ Import `Entropy`, `XorShift64` and `generate` from `seqcheck`. Tests inject a
 different entropy implementation without changing the generator. No ambient
 clock, filesystem, chain state or host RNG affects the library.
 
+To use a standard-library RNG instead:
+
+```fe
+use std::evm::random::ReplayRng
+use seqcheck::{Entropy, StdEntropy, generate}
+
+var rng = StdEntropy { rng: ReplayRng::new([1, 14, 12, 15]) }
+let trace = with (Entropy = rng) { generate<8>(8, 16) }
+```
+
+The wrapped RNG remains available as `rng.rng` with its advanced state. Its
+preconditions and backend requirements still apply: for example, `ReplayRng`
+needs a nonempty word array when drawn, and `KeccakRng` uses EVM crypto helpers.
+The adapter does not make EVM-specific operations available on the native
+backend. Adapter tests use `ReplayRng` and a counting `Rng` on both backends;
+they cover low-bit conversion, cyclic replay, draw counts, and a generated
+trace reduced to a regression that fails on the buggy model and passes on the
+corrected model.
+
 ## Architecture and contracts
 
 - [`engine.fe`](src/engine.fe): model trait, replay records and bounded reducer.
 - [`entropy.fe`](src/entropy.fe): injectable entropy, deterministic xorshift64
-  and bounded word generation.
+  and bounded word generation, plus the standard-library `Rng` adapter.
 - [`ledger.fe`](src/ledger.fe): deliberately faulty/corrected demonstration model.
 - [`examples/demo`](examples/demo): native JSON command-line example.
 - [`scripts/verify.py`](scripts/verify.py): independent behavioral checks of the
